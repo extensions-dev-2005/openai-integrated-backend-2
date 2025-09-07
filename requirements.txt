@@ -1,0 +1,18 @@
+fastapi
+uvicorn[standard]
+tenacity
+pydantic
+httpx
+python-multipart
+pydub
+openai
+httpx
+soundfile
+python-dotenv
+aiofiles
+gunicorn
+redis
+uvloop  # Unix only - faster event loop
+httptools  # Faster HTTP parsing
+pydub
+ffmpeg-python
