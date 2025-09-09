@@ -11,17 +11,12 @@ import hashlib
 from concurrent.futures import ThreadPoolExecutor
 import functools
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, BackgroundTasks, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-
-# New imports for ffmpeg
-import ffmpeg
-import subprocess
 
 # Configure logging with better formatting
 logging.basicConfig(
@@ -37,9 +32,8 @@ logger = logging.getLogger(__name__)
 # Global variables
 openai_client = None
 thread_pool = ThreadPoolExecutor(max_workers=4)
-transcription_cache: Dict[str, Dict] = {}  # Simple in-memory cache with TTL
+transcription_cache = {}  # Simple in-memory cache
 client_session = None
-CACHE_MAX_SIZE = 100  # Limit cache size to prevent memory issues
 
 # Enhanced Request/Response models
 class TextRequest(BaseModel):
@@ -71,7 +65,7 @@ class HealthResponse(BaseModel):
     message: str
     models_loaded: Dict[str, bool]
     uptime: float
-    version: str = "2.2.0"  # Updated version
+    version: str = "2.1.0"
 
 # Cache utilities
 def get_cache_key(content: bytes) -> str:
@@ -79,13 +73,7 @@ def get_cache_key(content: bytes) -> str:
     return hashlib.md5(content).hexdigest()
 
 def cache_transcription(key: str, result: dict, ttl: int = 3600):
-    """Cache transcription result with TTL, evict oldest if over max size"""
-    if len(transcription_cache) >= CACHE_MAX_SIZE:
-        # Evict oldest entry
-        oldest_key = min(transcription_cache, key=lambda k: transcription_cache[k]['timestamp'])
-        del transcription_cache[oldest_key]
-        logger.info(f"🧹 Evicted oldest cache entry: {oldest_key}")
-
+    """Cache transcription result with TTL"""
     transcription_cache[key] = {
         'result': result,
         'timestamp': time.time(),
@@ -110,14 +98,14 @@ async def lifespan(app: FastAPI):
     """Manage application lifecycle"""
     global openai_client, client_session
 
-    logger.info("🚀 Starting Nova.AI Backend v2.2.0 with OpenAI...")
+    logger.info("🚀 Starting Nova.AI Backend v2.1.0 with OpenAI...")
     start_time = time.time()
 
     try:
         # Initialize HTTP client
         client_session = httpx.AsyncClient(
-            timeout=httpx.Timeout(60.0),  # Increased timeout for robustness
-            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20)
+            timeout=httpx.Timeout(30.0),
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
         )
 
         # Initialize OpenAI client
@@ -141,13 +129,12 @@ async def lifespan(app: FastAPI):
     if client_session:
         await client_session.aclose()
     thread_pool.shutdown(wait=True)
-    transcription_cache.clear()
     logger.info("✅ Shutdown complete")
 
 # Initialize FastAPI app with lifespan
 app = FastAPI(
     title="Nova.AI Backend",
-    version="2.2.0",
+    version="2.1.0",
     description="High-performance meeting transcription and AI assistant with OpenAI",
     lifespan=lifespan
 )
@@ -203,9 +190,8 @@ def _get_colab_key() -> Optional[str]:
     except:
         return None
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
 async def test_openai_connection():
-    """Test OpenAI API connectivity with retry"""
+    """Test OpenAI API connectivity"""
     if not openai_client:
         raise ValueError("OpenAI client not initialized")
 
@@ -225,7 +211,7 @@ def cleanup_cache():
     """Remove expired cache entries"""
     current_time = time.time()
     expired_keys = [
-        key for key, data in list(transcription_cache.items())
+        key for key, data in transcription_cache.items()
         if current_time - data['timestamp'] > data['ttl']
     ]
     for key in expired_keys:
@@ -238,45 +224,53 @@ def cleanup_cache():
 def validate_audio_file(content_type: str, file_size: int, filename: str = "") -> tuple[bool, str]:
     """Enhanced audio file validation for OpenAI Whisper"""
 
-    # Size validation (25MB for OpenAI Whisper, but buffer for safety)
-    max_size = 25 * 1024 * 1024 - 1024  # 25MB - 1KB buffer
+    # Size validation (25MB for OpenAI Whisper)
+    max_size = 24 * 1024 * 1024
     if file_size > max_size:
-        return False, f"File too large: {file_size/1024/1024:.1f}MB (max: 25MB)"
+        return False, f"File too large: {file_size/1024/1024:.1f}MB (max: 24MB)"
 
-    if file_size < 100:  # Minimum viable audio (reduced for edge cases like short clips)
-        return False, "File too small (minimum: 100 bytes)"
+    if file_size < 1000:  # Minimum viable audio
+        return False, "File too small (minimum: 1KB)"
 
-    # Since we use ffmpeg, we can support almost any audio/video format as input
-    # But output to supported OpenAI formats: mp3, mp4, mpeg, mpga, m4a, wav, webm
-    return True, "Valid for processing"
+    # Format validation - - OpenAI supports more formats
+    supported_types = {
+        'audio/webm', 'audio/wav', 'audio/mp3', 'audio/m4a', 
+        'audio/ogg', 'audio/flac', 'audio/mpeg', 'audio/mp4',
+        'audio/mpga', 'audio/webm'
+    }
 
-def convert_audio_optimized(audio_bytes: bytes, target_format: str = "mp3") -> bytes:
-    """Optimized audio conversion using ffmpeg-python"""
+    if content_type in supported_types:
+        return True, "Valid format"
+
+    # Check filename extension - OpenAI supports - 
+    if filename:
+        ext = filename.lower().split('.')[-1]
+        if ext in ['webm', 'wav', 'mp3', 'm4a', 'ogg', 'flac', 'mp4', 'mpga']:
+            return True, "Valid format (by extension)"
+
+    return False, f"Unsupported format: {content_type}"
+
+def convert_audio_optimized(audio_bytes: bytes, target_format: str = "wav") -> bytes:
+    """Optimized audio conversion using pydub"""
     try:
-        # Use ffmpeg to convert to 16kHz mono mp3 (good compression, supported by OpenAI)
-        process = (
-            ffmpeg
-            .input('pipe:0')
-            .output('pipe:1', format=target_format, ar=16000, ac=1, audio_bitrate='64k')
-            .overwrite_output()
-            .run_async(pipe_stdin=True, pipe_stdout=True, pipe_stderr=True)
-        )
+        from pydub import AudioSegment
 
-        stdout, stderr = process.communicate(input=audio_bytes)
-        
-        if process.returncode != 0:
-            raise RuntimeError(f"FFmpeg error: {stderr.decode('utf-8')}")
+        # Load with automatic format detection
+        audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
 
-        converted = stdout
+        # Optimize for transcription: 16kHz mono (optional for OpenAI)
+        audio = audio.set_frame_rate(16000).set_channels(1)
+
+        # Export to target format
+        output_buffer = io.BytesIO()
+        audio.export(output_buffer, format=target_format)
+
+        converted = output_buffer.getvalue()
         logger.info(f"Audio converted: {len(audio_bytes)} -> {len(converted)} bytes")
         return converted
 
-    except subprocess.CalledProcessError as e:
-        logger.error(f"FFmpeg subprocess error: {e}")
-        raise
     except Exception as e:
-        logger.warning(f"Conversion failed: {e}, using original if possible")
-        # Fallback: if conversion fails, try to use original if it's a supported format
+        logger.warning(f"Conversion failed: {e}, using original")
         return audio_bytes
 
 # Async wrapper for CPU-intensive operations
@@ -297,10 +291,12 @@ def process_audio_sync(audio_bytes: bytes, content_type: str, filename: str) -> 
         if not is_valid:
             raise ValueError(msg)
 
-        # Always convert with ffmpeg for consistency (handle corrupted files better)
-        processed_audio = convert_audio_optimized(audio_bytes)
-        return processed_audio, "mp3"
+        # Convert if needed (optional for OpenAI as it accepts many formats)
+        if content_type not in ['audio/wav', 'audio/mp3', 'audio/m4a']:
+            audio_bytes = convert_audio_optimized(audio_bytes)
+            return audio_bytes, "wav"
 
+        return audio_bytes, "mp3" if content_type == 'audio/mp3' else "wav"
     except Exception as e:
         logger.error(f"Audio processing failed: {e}")
         raise
@@ -311,7 +307,7 @@ async def root():
     """Root endpoint with API info"""
     return {
         "service": "Nova.AI Backend API",
-        "version": "2.2.0",
+        "version": "2.1.0",
         "status": "operational",
         "ai_provider": "OpenAI",
         "features": {
@@ -319,8 +315,7 @@ async def root():
             "summarization": True,
             "response_suggestions": True,
             "caching": True,
-            "async_processing": True,
-            "ffmpeg_processing": True
+            "async_processing": True
         },
         "endpoints": ["/health", "/transcribe", "/summarize", "/suggest_response"],
         "docs": "/docs"
@@ -335,38 +330,32 @@ async def health_check():
     status = "healthy"
     message = "All systems operational"
 
-    models_loaded = {
-        "openai_client": openai_client is not None,
-        "whisper_api": openai_client is not None,
-        "text_generation": openai_client is not None,
-        "thread_pool": not thread_pool._shutdown,
-        "cache": bool(transcription_cache)  # Check if cache is usable
-    }
-
     if startup_error:
         status = "degraded"
         message = f"Startup issues: {startup_error}"
     elif openai_client is None:
         status = "degraded" 
         message = "OpenAI client unavailable"
-    elif any(not loaded for loaded in models_loaded.values()):
-        status = "degraded"
-        message = "Some components unavailable"
 
     return HealthResponse(
         status=status,
         message=message,
         uptime=uptime,
-        models_loaded=models_loaded
+        models_loaded={
+            "openai_client": openai_client is not None,
+            "whisper_api": openai_client is not None,
+            "text_generation": openai_client is not None,
+            "thread_pool": not thread_pool._shutdown,
+            "cache": len(transcription_cache) > 0 if transcription_cache else True
+        }
     )
 
 @app.post("/transcribe", response_model=TranscriptionResponse)
 async def transcribe_audio(
     audio: UploadFile = File(..., description="Audio file for transcription"),
-    language: Optional[str] = Query(None, description="Optional language code for transcription (auto-detect if None)"),
     background_tasks: BackgroundTasks = None
 ):
-    """Enhanced transcription with OpenAI Whisper, caching, and language support"""
+    """Enhanced transcription with OpenAI Whisper and caching"""
 
     if openai_client is None:
         raise HTTPException(
@@ -407,27 +396,20 @@ async def transcribe_audio(
             temp_file_path = temp_file.name
 
         try:
-            # OpenAI Whisper transcription with retry
-            @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), retry_if_exception_type(Exception))
-            def transcribe_with_openai():
-                logger.info("🔊 Starting OpenAI Whisper transcription...")
-                with open(temp_file_path, "rb") as file:
-                    return openai_client.audio.transcriptions.create(
-                        model="whisper-1",  # Use standard Whisper model
-                        file=file,
-                        response_format="verbose_json",
-                        temperature=0.0,
-                        language=language if language else None  # Auto-detect if None
-                    )
+            # OpenAI Whisper transcription
+            logger.info("🔊 Starting OpenAI Whisper transcription...")
 
-            transcription_response = transcribe_with_openai()
+            with open(temp_file_path, "rb") as file:
+                transcription_response = openai_client.audio.transcriptions.create(
+                    model="whisper-1",  # Using the specific transcription model
+                    file=file,
+                    response_format="verbose_json",
+                    temperature=0.0,
+                    language="en"
+                )
 
             # Process transcription result
             raw_text = transcription_response.text.strip() if transcription_response.text else ""
-
-            if not raw_text:
-                logger.warning("⚠️ Transcription returned empty text - possible silent audio")
-                raw_text = "[No audible speech detected]"
 
             # Enhanced text cleaning
             cleaned_text = clean_transcription_text(raw_text)
@@ -437,7 +419,7 @@ async def transcribe_audio(
             result = {
                 'text': cleaned_text,
                 'duration': getattr(transcription_response, 'duration', None),
-                'language': getattr(transcription_response, 'language', language or "auto-detected"),
+                'language': getattr(transcription_response, 'language', None),
                 'confidence': calculate_confidence(cleaned_text),
                 'processing_time': processing_time,
                 'cached': False
@@ -467,26 +449,15 @@ async def transcribe_audio(
         logger.error(traceback.format_exc())
 
         # Enhanced error handling
-        error_str = str(e).lower()
-        if "rate_limit" in error_str:
+        if "rate_limit" in str(e).lower():
             raise HTTPException(
                 status_code=429, 
                 detail="Rate limit exceeded. Please try again in a moment."
             )
-        elif "file_size" in error_str or "too large" in error_str:
+        elif "file_size" in str(e).lower():
             raise HTTPException(
                 status_code=413, 
-                detail="Audio file too large (max: 25MB)"
-            )
-        elif "invalid" in error_str or "unsupported" in error_str:
-            raise HTTPException(
-                status_code=415, 
-                detail="Unsupported or invalid audio format"
-            )
-        elif "no speech" in error_str or len(raw_text) == 0:
-            raise HTTPException(
-                status_code=400, 
-                detail="No speech detected in audio"
+                detail="Audio file too large (max: 24MB)"
             )
         else:
             raise HTTPException(
@@ -515,14 +486,13 @@ def clean_transcription_text(text: str) -> str:
     import re
     cleaned = re.sub(r'\s+', ' ', cleaned)
     cleaned = re.sub(r'\.{2,}', '.', cleaned)
-    cleaned = re.sub(r'^\s*[\[\(].*?[\]\)]\s*', '', cleaned)  # Remove leading brackets
     cleaned = cleaned.strip()
 
     return cleaned
 
 def calculate_confidence(text: str) -> float:
     """Simple confidence calculation based on text characteristics"""
-    if not text or text == "[No audible speech detected]":
+    if not text:
         return 0.0
 
     # Basic heuristics
@@ -533,17 +503,14 @@ def calculate_confidence(text: str) -> float:
     # Factors that increase confidence
     has_punctuation = any(c in text for c in '.!?')
     avg_word_length = sum(len(word) for word in text.split()) / word_count
-    has_varied_content = len(set(text.split())) / word_count > 0.5  # Avoid repetitive text
 
     confidence = 0.5  # Base confidence
 
     if has_punctuation:
-        confidence += 0.15
-    if 3 <= avg_word_length <= 8:
-        confidence += 0.15
+        confidence += 0.2
+    if 3 <= avg_word_length <= 8:  # Reasonable word length
+        confidence += 0.2
     if word_count >= 5:
-        confidence += 0.1
-    if has_varied_content:
         confidence += 0.1
 
     return min(confidence, 1.0)
@@ -565,8 +532,8 @@ async def summarize_text(request: TextRequest):
                 detail="Text too short for summarization (minimum: 50 characters)"
             )
 
-        # Truncate if too long (approximate token limit for gpt-4o-mini ~128k tokens, but safe)
-        max_chars = 100000  
+        # Truncate if too long (OpenAI has higher token limits)
+        max_chars = 15000  # Increased for OpenAI
         if len(text) > max_chars:
             text = text[:max_chars] + "... [truncated]"
 
@@ -598,18 +565,14 @@ DECISIONS: [any decisions made]"""
             }
         ]
 
-        # Retry for summarization
-        @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), retry_if_exception_type(Exception))
-        def summarize_with_openai():
-            return openai_client.chat.completions.create(
-                messages=messages,
-                model="gpt-4o-mini",
-                max_tokens=800,
-                temperature=0.3,
-                top_p=0.9
-            )
+        response = openai_client.chat.completions.create(
+            messages=messages,
+            model="gpt-4o-mini",  # Using GPT-4o-mini for cost efficiency
+            max_tokens=800,
+            temperature=0.3,
+            top_p=0.9
+        )
 
-        response = summarize_with_openai()
         raw_summary = response.choices[0].message.content.strip()
 
         # Parse structured response
@@ -641,20 +604,22 @@ def parse_structured_summary(raw_text: str) -> dict:
         'action_items': []
     }
 
-    # Extract sections with more robust regex
+    # Extract sections
     summary_match = re.search(r'SUMMARY:\s*(.*?)(?=KEY POINTS:|ACTION ITEMS:|DECISIONS:|$)', raw_text, re.DOTALL | re.IGNORECASE)
     if summary_match:
         result['summary'] = summary_match.group(1).strip()
 
+    # Extract key points
     key_points_match = re.search(r'KEY POINTS:\s*(.*?)(?=ACTION ITEMS:|DECISIONS:|$)', raw_text, re.DOTALL | re.IGNORECASE)
     if key_points_match:
         points_text = key_points_match.group(1).strip()
-        result['key_points'] = [point.strip('- •*').strip() for point in re.split(r'\n', points_text) if point.strip()]
+        result['key_points'] = [point.strip('- •').strip() for point in points_text.split('\n') if point.strip()]
 
+    # Extract action items
     action_match = re.search(r'ACTION ITEMS:\s*(.*?)(?=DECISIONS:|$)', raw_text, re.DOTALL | re.IGNORECASE)
     if action_match:
         actions_text = action_match.group(1).strip()
-        result['action_items'] = [action.strip('- •*').strip() for action in re.split(r'\n', actions_text) if action.strip()]
+        result['action_items'] = [action.strip('- •').strip() for action in actions_text.split('\n') if action.strip()]
 
     # Fallback to original text if parsing fails
     if not result['summary']:
@@ -673,7 +638,7 @@ async def suggest_response(request: TextRequest):
 
     try:
         # Get recent context (increased for better analysis)
-        text = request.text[-16000:] if len(request.text) > 16000 else request.text  # Increased for gpt-4o-mini
+        text = request.text[-8000:] if len(request.text) > 8000 else request.text
 
         if len(text.strip()) < 20:
             raise HTTPException(
@@ -683,20 +648,40 @@ async def suggest_response(request: TextRequest):
 
         logger.info(f"💭 Generating response suggestion for {len(text)} characters")
 
-        # Fallback to chat completion (assuming responses API might not be standard)
-        messages = [
-            {
-                "role": "system",
-                "content": """You are a professional meeting assistant. Your task is to:
+        # Try using OpenAI's response generation if available, fallback to chat completion
+        try:
+            # Using OpenAI's responses API if available
+            response = openai_client.responses.create(
+                model="gpt-4o-mini",
+                instructions="""You are a professional meeting assistant. Analyze the meeting transcript and provide:
+1. Identify the most recent question, request, or discussion point
+2. Provide a brief, professional response suggestion (1-3 sentences)
+3. Indicate your confidence level (High/Medium/Low)
+
+Format your response as:
+CONTEXT: [what you're responding to]
+SUGGESTION: [your suggested response]
+CONFIDENCE: [High/Medium/Low]""",
+                input=f"Meeting transcript:\n{text}"
+            )
+
+            raw_response = response.output_text.strip()
+
+        except AttributeError:
+            # Fallback to chat completion if responses API not available
+            messages = [
+                {
+                    "role": "system",
+                    "content": """You are a professional meeting assistant. Your task is to:
 1. Identify the most recent question, request, or discussion point
 2. Provide a brief, professional response suggestion
 3. Indicate your confidence level (High/Medium/Low)
 
 Keep responses concise but complete (1-3 sentences). Be professional and contextually appropriate."""
-            },
-            {
-                "role": "user",
-                "content": f"""Analyze this meeting transcript and suggest a professional response to the most recent query or discussion point:
+                },
+                {
+                    "role": "user",
+                    "content": f"""Analyze this meeting transcript and suggest a professional response to the most recent query or discussion point:
 
 {text}
 
@@ -704,13 +689,10 @@ Provide your response in this format:
 CONTEXT: [what you're responding to]
 SUGGESTION: [your suggested response]
 CONFIDENCE: [High/Medium/Low]"""
-            }
-        ]
+                }
+            ]
 
-        # Retry for suggestion
-        @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), retry_if_exception_type(Exception))
-        def suggest_with_openai():
-            return openai_client.chat.completions.create(
+            response = openai_client.chat.completions.create(
                 messages=messages,
                 model="gpt-4o-mini",
                 max_tokens=400,
@@ -718,8 +700,7 @@ CONFIDENCE: [High/Medium/Low]"""
                 top_p=0.9
             )
 
-        response = suggest_with_openai()
-        raw_response = response.choices[0].message.content.strip()
+            raw_response = response.choices[0].message.content.strip()
 
         parsed_response = parse_response_suggestion(raw_response)
 
@@ -749,7 +730,7 @@ def parse_response_suggestion(raw_text: str) -> dict:
         'confidence': 'Medium'
     }
 
-    # Extract sections with more robust regex
+    # Extract sections
     context_match = re.search(r'CONTEXT:\s*(.*?)(?=SUGGESTION:|CONFIDENCE:|$)', raw_text, re.DOTALL | re.IGNORECASE)
     if context_match:
         result['context'] = context_match.group(1).strip()
@@ -807,11 +788,10 @@ if __name__ == "__main__":
     log_level = os.getenv("LOG_LEVEL", "info").lower()
 
     uvicorn.run(
-        "app:app",  # Adjust if file name changes
+        "app:app",
         host="0.0.0.0",
         port=port,
         log_level=log_level,
         access_log=True,
-        reload=os.getenv("ENVIRONMENT") != "production",
-        workers=2  # Add workers for better concurrency
+        reload=os.getenv("ENVIRONMENT") != "production"
     )
